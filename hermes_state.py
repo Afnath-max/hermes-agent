@@ -530,6 +530,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     cache_write_tokens INTEGER DEFAULT 0,
     reasoning_tokens INTEGER DEFAULT 0,
     cwd TEXT,
+    git_branch TEXT,
     billing_provider TEXT,
     billing_base_url TEXT,
     billing_mode TEXT,
@@ -1339,13 +1340,29 @@ class SessionDB:
             )
         self._execute_write(_do)
 
-    def update_session_cwd(self, session_id: str, cwd: str) -> None:
-        """Persist the session working directory when a frontend knows it."""
+    def update_session_cwd(self, session_id: str, cwd: str, git_branch: str = None) -> None:
+        """Persist the session working directory when a frontend knows it.
+
+        ``git_branch`` records the git branch checked out in ``cwd`` at the time
+        the session started/resumed. The sidebar groups main-checkout sessions
+        by this so feature-branch work doesn't pile under a single "main" row
+        (the main checkout's *current* branch is transient and would
+        misattribute past sessions). Only written when non-empty so a probe
+        failure never clobbers a previously-captured branch.
+        """
         if not session_id or not cwd:
             return
 
+        branch = (git_branch or "").strip()
+
         def _do(conn):
-            conn.execute("UPDATE sessions SET cwd = ? WHERE id = ?", (cwd, session_id))
+            if branch:
+                conn.execute(
+                    "UPDATE sessions SET cwd = ?, git_branch = ? WHERE id = ?",
+                    (cwd, branch, session_id),
+                )
+            else:
+                conn.execute("UPDATE sessions SET cwd = ? WHERE id = ?", (cwd, session_id))
 
         self._execute_write(_do)
     # ──────────────────────────────────────────────────────────────────────

@@ -1,5 +1,5 @@
 import type { HermesWorktreeInfo } from '@/global'
-import type { SessionInfo } from '@/hermes'
+import type { ProjectInfo, SessionInfo } from '@/hermes'
 
 export interface SidebarSessionGroup {
   id: string
@@ -8,6 +8,8 @@ export interface SidebarSessionGroup {
   sessions: SessionInfo[]
   // Profile color for the ALL-profiles view; absent for workspace groups.
   color?: null | string
+  // True when this group is a repo's main checkout (vs a linked worktree).
+  isMain?: boolean
   loadingMore?: boolean
   mode?: 'profile' | 'source' | 'workspace'
   onLoadMore?: () => void
@@ -146,7 +148,15 @@ interface WorkspacePlacement {
   worktreeKey: string
   worktreeLabel: string
   worktreePath: string
+  // True when this group lives in the repo's MAIN checkout directory (vs a
+  // linked worktree). The main checkout is never `git worktree remove`-able, and
+  // its sessions split into per-branch groups (below). Linked worktrees are
+  // per-branch by construction and removable.
+  isMain: boolean
 }
+
+/** Default-branch names that sort first and read as the repo's trunk. */
+const TRUNK_BRANCHES = new Set(['main', 'master', 'trunk', 'develop'])
 
 /** Replace a path's final segment, preserving its prefix + separators. */
 const withBaseName = (path: string, name: string): string =>
@@ -176,7 +186,8 @@ function placeByHeuristic(path: string): WorkspacePlacement | null {
       parentPath: repoPath,
       worktreeKey: path,
       worktreeLabel: worktreeMatch[2],
-      worktreePath: path
+      worktreePath: path,
+      isMain: false
     }
   }
 
@@ -186,27 +197,48 @@ function placeByHeuristic(path: string): WorkspacePlacement | null {
     parentPath: path,
     worktreeKey: path,
     worktreeLabel: base,
-    worktreePath: path
+    worktreePath: path,
+    isMain: true
   }
 }
 
-function placeWorkspace(path: string, resolver?: WorktreeResolver): WorkspacePlacement | null {
+function placeWorkspace(path: string, sessionBranch: string, resolver?: WorktreeResolver): WorkspacePlacement | null {
   const info = resolver?.(path)
 
   if (info?.repoRoot && info.worktreeRoot) {
     const dirLabel = baseName(info.worktreeRoot) || info.worktreeRoot
+
+    if (info.isMainWorktree) {
+      // Split the main checkout by the branch each session recorded at run time
+      // (session.git_branch — the true history). We deliberately do NOT fall
+      // back to the repo's *current* branch for unrecorded sessions: git only
+      // knows what's checked out now, not what was checked out when an old
+      // session ran, so that fallback misattributes every legacy session to the
+      // current branch. Unknown-branch sessions collapse into a neutral "main"
+      // bucket instead of claiming a branch we can't prove.
+      const branch = sessionBranch.trim()
+
+      return {
+        parentKey: info.repoRoot,
+        parentLabel: baseName(info.repoRoot) ?? info.repoRoot,
+        parentPath: info.repoRoot,
+        worktreeKey: branch ? `${info.repoRoot}::branch::${branch}` : `${info.repoRoot}::branch::`,
+        worktreeLabel: branch || 'main',
+        worktreePath: info.worktreeRoot,
+        isMain: true
+      }
+    }
 
     return {
       parentKey: info.repoRoot,
       parentLabel: baseName(info.repoRoot) ?? info.repoRoot,
       parentPath: info.repoRoot,
       worktreeKey: info.worktreeRoot,
-      // The main checkout's branch is transient — it changes as you work, so a
-      // branch label would misattribute every past session to whatever branch
-      // is checked out *now*. Label it by directory. Linked worktrees are
-      // per-branch by construction, so branch is the clearest label there.
-      worktreeLabel: info.isMainWorktree ? dirLabel : info.branch || dirLabel,
-      worktreePath: info.worktreeRoot
+      // Linked worktrees are per-branch by construction, so branch is the
+      // clearest label there.
+      worktreeLabel: info.branch || dirLabel,
+      worktreePath: info.worktreeRoot,
+      isMain: false
     }
   }
 
@@ -259,7 +291,7 @@ export function workspaceTreeFor(
       continue
     }
 
-    const placement = placeWorkspace(path, resolver)
+    const placement = placeWorkspace(path, session.git_branch?.trim() || '', resolver)
 
     if (!placement) {
       noWorkspace.push(session)
@@ -271,7 +303,13 @@ export function workspaceTreeFor(
 
     if (!entry) {
       entry = {
-        group: { id: placement.worktreeKey, label: placement.worktreeLabel, path: placement.worktreePath, sessions: [] },
+        group: {
+          id: placement.worktreeKey,
+          label: placement.worktreeLabel,
+          path: placement.worktreePath,
+          isMain: placement.isMain,
+          sessions: []
+        },
         parentKey: placement.parentKey,
         parentLabel: placement.parentLabel,
         parentPath: placement.parentPath
@@ -302,6 +340,28 @@ export function workspaceTreeFor(
     parent.sessionCount += entry.group.sessions.length
   }
 
+  // Order groups within a repo: main-checkout branches first (trunk like
+  // main/master ahead of feature branches, then alphabetical), then linked
+  // worktrees. Keeps the trunk pinned to the top regardless of activity.
+  for (const parent of parents.values()) {
+    parent.groups.sort((a, b) => {
+      if (Boolean(a.isMain) !== Boolean(b.isMain)) {
+        return a.isMain ? -1 : 1
+      }
+
+      if (a.isMain && b.isMain) {
+        const aTrunk = TRUNK_BRANCHES.has(a.label.toLowerCase())
+        const bTrunk = TRUNK_BRANCHES.has(b.label.toLowerCase())
+
+        if (aTrunk !== bTrunk) {
+          return aTrunk ? -1 : 1
+        }
+      }
+
+      return a.label.localeCompare(b.label, undefined, { sensitivity: 'base' })
+    })
+  }
+
   const result = [...parents.values()]
 
   if (noWorkspace.length) {
@@ -320,6 +380,164 @@ export function workspaceTreeFor(
 
   for (const parent of result) {
     disambiguateLabels(parent.groups)
+  }
+
+  return result
+}
+
+// ── Project-level grouping ───────────────────────────────────────────────────
+// A Project is a human-named, persisted, multi-folder workspace. It is the new
+// outermost grouping level: sessions belong to a project when their cwd lives
+// under one of the project's folders. Inside a project the existing
+// repo -> worktree -> sessions tree is preserved, so a project that contains a
+// git repo still shows its worktrees/branches.
+
+export const NO_PROJECT_ID = '__no_project__'
+
+/** True when `target` equals `folder` or is nested under it (segment-wise). */
+function isPathUnder(folder: string, target: string): boolean {
+  const f = segments(folder)
+  const t = segments(target)
+
+  if (f.length === 0 || f.length > t.length) {
+    return false
+  }
+
+  for (let i = 0; i < f.length; i += 1) {
+    if (f[i] !== t[i]) {
+      return false
+    }
+  }
+
+  return true
+}
+
+/**
+ * Resolve which (non-archived) project owns `cwd` by longest-prefix folder
+ * match — the most specific folder wins, so nested projects resolve to the
+ * innermost one. Mirrors the backend `projects_db.project_for_path`.
+ */
+export function projectForPath(projects: ProjectInfo[], cwd: string): ProjectInfo | null {
+  const target = (cwd || '').trim()
+
+  if (!target) {
+    return null
+  }
+
+  let best: ProjectInfo | null = null
+  let bestLen = -1
+
+  for (const project of projects) {
+    if (project.archived) {
+      continue
+    }
+
+    for (const folder of project.folders) {
+      if (isPathUnder(folder.path, target)) {
+        const len = segments(folder.path).length
+
+        if (len > bestLen) {
+          bestLen = len
+          best = project
+        }
+      }
+    }
+  }
+
+  return best
+}
+
+/** A project node: human-named, holds the repo->worktree subtree for its sessions. */
+export interface SidebarProjectTree {
+  id: string
+  label: string
+  path: null | string
+  color?: null | string
+  icon?: null | string
+  archived?: boolean
+  // A git repo / directory promoted to a project automatically from session
+  // cwds (not a user-created entry in projects.db). Deletable = dismissable.
+  isAuto?: boolean
+  // The synthetic "No project" bucket for cwd-less sessions.
+  isNoProject?: boolean
+  repos: SidebarWorkspaceTree[]
+  sessionCount: number
+}
+
+/**
+ * Build the project overview: `project -> repo -> worktree -> sessions`.
+ *
+ * Three tiers, in order:
+ *  1. **Explicit projects** (user-created, from projects.db) — always shown,
+ *     even with zero sessions, so a freshly-created project is visible.
+ *  2. **Auto projects** — every git repo / directory inferred from the
+ *     remaining session cwds becomes its own project (the old "workspace"
+ *     logic, now first-class). Flagged `isAuto` so the UI can offer
+ *     delete-as-dismiss and "save as project".
+ *
+ * Sessions with no cwd belong to no project and are simply omitted from the
+ * overview (they remain in the flat recents list and search) — there is no
+ * "No project" bucket. A session is claimed by the most specific explicit
+ * project first (longest-prefix), so auto projects never double-count.
+ */
+export function projectTreeFor(
+  sessions: SessionInfo[],
+  projects: ProjectInfo[],
+  noWorkspaceLabel: string,
+  resolver?: WorktreeResolver,
+  options: { preserveSessionOrder?: boolean } = {}
+): SidebarProjectTree[] {
+  const activeProjects = projects.filter(project => !project.archived)
+  const byProject = new Map<string, SessionInfo[]>()
+  const unowned: SessionInfo[] = []
+
+  for (const session of sessions) {
+    const cwd = session.cwd?.trim() || ''
+    const project = cwd ? projectForPath(activeProjects, cwd) : null
+
+    if (project) {
+      const list = byProject.get(project.id) ?? []
+      list.push(session)
+      byProject.set(project.id, list)
+    } else {
+      unowned.push(session)
+    }
+  }
+
+  const result: SidebarProjectTree[] = []
+
+  // Tier 1: explicit, user-created projects.
+  for (const project of activeProjects) {
+    const projectSessions = byProject.get(project.id) ?? []
+
+    result.push({
+      id: project.id,
+      label: project.name,
+      path: project.primary_path,
+      color: project.color,
+      icon: project.icon,
+      archived: false,
+      repos: workspaceTreeFor(projectSessions, noWorkspaceLabel, resolver, options),
+      sessionCount: projectSessions.length
+    })
+  }
+
+  // Tier 2: derive auto-projects (one per inferred repo/dir) from the leftover
+  // sessions. The cwd-less bucket (NO_WORKSPACE_ID) is intentionally dropped —
+  // those sessions have no project and don't belong in the overview.
+  for (const parent of workspaceTreeFor(unowned, noWorkspaceLabel, resolver, options)) {
+    if (parent.id === NO_WORKSPACE_ID) {
+      continue
+    }
+
+    result.push({
+      id: parent.id,
+      label: parent.label,
+      path: parent.path,
+      isAuto: true,
+      repos: [parent],
+      sessionCount: parent.sessionCount
+    })
   }
 
   return result

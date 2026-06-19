@@ -888,11 +888,53 @@ export interface Translations {
     cronJobs: string
     groupAriaGrouped: string
     groupAriaUngrouped: string
+    showProjects: string
+    showSessions: string
     groupTitleGrouped: string
     groupTitleUngrouped: string
     allPinned: string
     shiftClickHint: string
     noWorkspace: string
+    noProject: string
+    projectEmpty: string
+    projects: {
+      sectionLabel: string
+      newButton: string
+      createTitle: string
+      createDesc: string
+      renameTitle: string
+      addFolderTitle: string
+      nameLabel: string
+      namePlaceholder: string
+      foldersLabel: string
+      noFolders: string
+      addFolder: string
+      primaryBadge: string
+      setPrimary: string
+      removeFolder: string
+      create: string
+      menu: string
+      menuRename: string
+      menuAddFolder: string
+      menuSetActive: string
+      menuArchive: string
+      menuDelete: string
+      menuSave: string
+      reveal: string
+      copyPath: string
+      removeFromSidebar: string
+      createFailed: string
+      startWork: string
+      newWorktreeTitle: string
+      newWorktreeDesc: string
+      branchPlaceholder: string
+      startWorkFailed: string
+      removeWorktree: string
+      removeWorktreeFailed: string
+      allProjects: string
+      backToAll: string
+      enter: (label: string) => string
+    }
     newSessionIn: (label: string) => string
     reorderWorkspace: (label: string) => string
     showMoreIn: (count: number, label: string) => string

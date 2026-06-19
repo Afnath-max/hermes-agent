@@ -28,6 +28,9 @@ const SIDEBAR_SESSION_ORDER_STORAGE_KEY = 'hermes.desktop.sessionOrder'
 const SIDEBAR_SESSION_ORDER_MANUAL_STORAGE_KEY = 'hermes.desktop.sessionOrder.manual'
 const SIDEBAR_WORKSPACE_ORDER_STORAGE_KEY = 'hermes.desktop.workspaceOrder'
 const SIDEBAR_WORKSPACE_PARENT_ORDER_STORAGE_KEY = 'hermes.desktop.workspaceParentOrder'
+const SIDEBAR_WORKSPACE_COLLAPSED_STORAGE_KEY = 'hermes.desktop.workspaceCollapsed'
+const SIDEBAR_DISMISSED_AUTO_PROJECTS_STORAGE_KEY = 'hermes.desktop.dismissedAutoProjects'
+const SIDEBAR_DISMISSED_WORKTREES_STORAGE_KEY = 'hermes.desktop.dismissedWorktrees'
 const PANES_FLIPPED_STORAGE_KEY = 'hermes.desktop.panesFlipped'
 
 export const CHAT_SIDEBAR_PANE_ID = 'chat-sidebar'
@@ -64,6 +67,24 @@ export const $sidebarWorkspaceOrderIds = atom(storedStringArray(SIDEBAR_WORKSPAC
 // Order of the top-level repo "parent" groups in the worktree tree (worktrees
 // within a parent reuse $sidebarWorkspaceOrderIds).
 export const $sidebarWorkspaceParentOrderIds = atom(storedStringArray(SIDEBAR_WORKSPACE_PARENT_ORDER_STORAGE_KEY))
+// Repo/worktree nodes that the user has explicitly COLLAPSED. Absent = open, so
+// a project's folders auto-open when you enter it (and persist your collapses
+// across reloads). Keyed by stable node id (repo root / worktree path).
+export const $sidebarWorkspaceCollapsedIds = atom<string[]>(
+  storedStringArray(SIDEBAR_WORKSPACE_COLLAPSED_STORAGE_KEY)
+)
+// Auto-derived (git-repo) projects the user has dismissed ("deleted") from the
+// overview. Keyed by repo-root path; persisted so they stay hidden. Explicit
+// projects are deleted for real instead — this only declutters the auto tier.
+export const $dismissedAutoProjectIds = atom<string[]>(
+  storedStringArray(SIDEBAR_DISMISSED_AUTO_PROJECTS_STORAGE_KEY)
+)
+// Worktree rows removed from the UI after a `git worktree remove`. The on-disk
+// dir is gone but historical sessions still reference its path, so we hide the
+// row by id (worktree path) to keep "remove" feeling real.
+export const $dismissedWorktreeIds = atom<string[]>(
+  storedStringArray(SIDEBAR_DISMISSED_WORKTREES_STORAGE_KEY)
+)
 export const $sidebarPinsOpen = atom(true)
 // Set by the PaneShell hover-reveal overlay while the sidebar is collapsed; kept
 // true the whole time it's a floating overlay (not just while shown) so the
@@ -95,7 +116,45 @@ $sidebarWorkspaceOrderIds.subscribe(ids => persistStringArray(SIDEBAR_WORKSPACE_
 $sidebarWorkspaceParentOrderIds.subscribe(ids =>
   persistStringArray(SIDEBAR_WORKSPACE_PARENT_ORDER_STORAGE_KEY, [...ids])
 )
+$sidebarWorkspaceCollapsedIds.subscribe(ids =>
+  persistStringArray(SIDEBAR_WORKSPACE_COLLAPSED_STORAGE_KEY, [...ids])
+)
 $sidebarAgentsGrouped.subscribe(grouped => persistBoolean(SIDEBAR_AGENTS_GROUPED_STORAGE_KEY, grouped))
+
+$dismissedAutoProjectIds.subscribe(ids =>
+  persistStringArray(SIDEBAR_DISMISSED_AUTO_PROJECTS_STORAGE_KEY, [...ids])
+)
+$dismissedWorktreeIds.subscribe(ids =>
+  persistStringArray(SIDEBAR_DISMISSED_WORKTREES_STORAGE_KEY, [...ids])
+)
+
+// Toggle a repo/worktree node's persisted collapse state (absent = open).
+export function toggleWorkspaceNodeCollapsed(id: string): void {
+  const current = $sidebarWorkspaceCollapsedIds.get()
+
+  $sidebarWorkspaceCollapsedIds.set(
+    current.includes(id) ? current.filter(nodeId => nodeId !== id) : [...current, id]
+  )
+}
+
+// Dismiss ("delete") an auto-derived project from the overview.
+export function dismissAutoProject(id: string): void {
+  const current = $dismissedAutoProjectIds.get()
+
+  if (!current.includes(id)) {
+    $dismissedAutoProjectIds.set([...current, id])
+  }
+}
+
+// Hide a worktree row after it's been removed via git.
+export function dismissWorktree(id: string): void {
+  const current = $dismissedWorktreeIds.get()
+
+  if (!current.includes(id)) {
+    $dismissedWorktreeIds.set([...current, id])
+  }
+}
+
 $panesFlipped.subscribe(flipped => persistBoolean(PANES_FLIPPED_STORAGE_KEY, flipped))
 
 export function setSidebarWidth(width: number) {

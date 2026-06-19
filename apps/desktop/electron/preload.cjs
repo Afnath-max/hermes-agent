@@ -55,7 +55,14 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   getRecentLogs: () => ipcRenderer.invoke('hermes:logs:recent'),
   readDir: dirPath => ipcRenderer.invoke('hermes:fs:readDir', dirPath),
   gitRoot: startPath => ipcRenderer.invoke('hermes:fs:gitRoot', startPath),
+  revealPath: targetPath => ipcRenderer.invoke('hermes:fs:reveal', targetPath),
   worktrees: cwds => ipcRenderer.invoke('hermes:fs:worktrees', cwds),
+  git: {
+    worktreeList: repoPath => ipcRenderer.invoke('hermes:git:worktreeList', repoPath),
+    worktreeAdd: (repoPath, options) => ipcRenderer.invoke('hermes:git:worktreeAdd', repoPath, options),
+    worktreeRemove: (repoPath, worktreePath, options) =>
+      ipcRenderer.invoke('hermes:git:worktreeRemove', repoPath, worktreePath, options)
+  },
   terminal: {
     dispose: id => ipcRenderer.invoke('hermes:terminal:dispose', id),
     resize: (id, size) => ipcRenderer.invoke('hermes:terminal:resize', id, size),

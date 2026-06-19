@@ -178,6 +178,7 @@ _LONG_HANDLERS = frozenset(
         "browser.manage",
         "cli.exec",
         "plugins.manage",
+        "projects.for_cwd",
         "session.branch",
         "session.compress",
         "session.resume",
@@ -1302,7 +1303,9 @@ def _set_session_cwd(session: dict, cwd: str) -> str:
     with _session_db(session) as db:
         if db is not None:
             try:
-                db.update_session_cwd(session.get("session_key", ""), resolved)
+                db.update_session_cwd(
+                    session.get("session_key", ""), resolved, _git_branch_for_cwd(resolved)
+                )
             except Exception:
                 logger.debug("failed to persist session cwd", exc_info=True)
     try:
@@ -3758,7 +3761,8 @@ def _init_session(
                     _sessions[sid]["cwd"] = row["cwd"]
         else:
             try:
-                db.update_session_cwd(key, _sessions[sid]["cwd"])
+                _cwd = _sessions[sid]["cwd"]
+                db.update_session_cwd(key, _cwd, _git_branch_for_cwd(_cwd))
             except Exception:
                 logger.debug("failed to persist resumed session cwd", exc_info=True)
     _register_session_cwd(_sessions[sid])
@@ -8045,6 +8049,229 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 5001, str(e))
 
     return _err(rid, 4002, f"unknown config key: {key}")
+
+
+# ---------------------------------------------------------------------------
+# Projects — first-class, per-profile, multi-folder workspaces
+# ---------------------------------------------------------------------------
+
+
+def _projects_payload(conn) -> dict:
+    from hermes_cli import projects_db as pdb
+
+    return {
+        "projects": [p.to_dict() for p in pdb.list_projects(conn, include_archived=True)],
+        "active_id": pdb.get_active_id(conn),
+    }
+
+
+@method("projects.list")
+def _(rid, params: dict) -> dict:
+    try:
+        from hermes_cli import projects_db as pdb
+
+        with pdb.connect_closing() as conn:
+            return _ok(rid, _projects_payload(conn))
+    except Exception as e:
+        return _err(rid, 5061, str(e))
+
+
+@method("projects.get")
+def _(rid, params: dict) -> dict:
+    try:
+        from hermes_cli import projects_db as pdb
+
+        with pdb.connect_closing() as conn:
+            proj = pdb.get_project(conn, str(params.get("id") or ""))
+            if proj is None:
+                return _err(rid, 5062, "no such project")
+            return _ok(rid, {"project": proj.to_dict()})
+    except Exception as e:
+        return _err(rid, 5061, str(e))
+
+
+@method("projects.create")
+def _(rid, params: dict) -> dict:
+    try:
+        from hermes_cli import projects_db as pdb
+
+        with pdb.connect_closing() as conn:
+            pid = pdb.create_project(
+                conn,
+                name=str(params.get("name") or ""),
+                slug=params.get("slug"),
+                folders=params.get("folders") or [],
+                primary_path=params.get("primary_path"),
+                description=params.get("description"),
+                icon=params.get("icon"),
+                color=params.get("color"),
+                board_slug=params.get("board_slug"),
+            )
+            if params.get("use"):
+                pdb.set_active(conn, pid)
+            proj = pdb.get_project(conn, pid)
+            return _ok(rid, {"project": proj.to_dict() if proj else None})
+    except ValueError as e:
+        return _err(rid, 5063, str(e))
+    except Exception as e:
+        return _err(rid, 5061, str(e))
+
+
+@method("projects.update")
+def _(rid, params: dict) -> dict:
+    try:
+        from hermes_cli import projects_db as pdb
+
+        pid = str(params.get("id") or "")
+        with pdb.connect_closing() as conn:
+            proj = pdb.get_project(conn, pid)
+            if proj is None:
+                return _err(rid, 5062, "no such project")
+            pdb.update_project(
+                conn,
+                proj.id,
+                name=params.get("name"),
+                description=params.get("description"),
+                icon=params.get("icon"),
+                color=params.get("color"),
+                board_slug=params.get("board_slug"),
+            )
+            return _ok(rid, {"project": pdb.get_project(conn, proj.id).to_dict()})
+    except ValueError as e:
+        return _err(rid, 5063, str(e))
+    except Exception as e:
+        return _err(rid, 5061, str(e))
+
+
+@method("projects.add_folder")
+def _(rid, params: dict) -> dict:
+    try:
+        from hermes_cli import projects_db as pdb
+
+        pid = str(params.get("id") or "")
+        with pdb.connect_closing() as conn:
+            proj = pdb.get_project(conn, pid)
+            if proj is None:
+                return _err(rid, 5062, "no such project")
+            pdb.add_folder(
+                conn,
+                proj.id,
+                str(params.get("path") or ""),
+                label=params.get("label"),
+                is_primary=bool(params.get("is_primary")),
+            )
+            return _ok(rid, {"project": pdb.get_project(conn, proj.id).to_dict()})
+    except ValueError as e:
+        return _err(rid, 5063, str(e))
+    except Exception as e:
+        return _err(rid, 5061, str(e))
+
+
+@method("projects.remove_folder")
+def _(rid, params: dict) -> dict:
+    try:
+        from hermes_cli import projects_db as pdb
+
+        pid = str(params.get("id") or "")
+        with pdb.connect_closing() as conn:
+            proj = pdb.get_project(conn, pid)
+            if proj is None:
+                return _err(rid, 5062, "no such project")
+            pdb.remove_folder(conn, proj.id, str(params.get("path") or ""))
+            return _ok(rid, {"project": pdb.get_project(conn, proj.id).to_dict()})
+    except Exception as e:
+        return _err(rid, 5061, str(e))
+
+
+@method("projects.set_primary")
+def _(rid, params: dict) -> dict:
+    try:
+        from hermes_cli import projects_db as pdb
+
+        pid = str(params.get("id") or "")
+        with pdb.connect_closing() as conn:
+            proj = pdb.get_project(conn, pid)
+            if proj is None:
+                return _err(rid, 5062, "no such project")
+            pdb.set_primary(conn, proj.id, str(params.get("path") or ""))
+            return _ok(rid, {"project": pdb.get_project(conn, proj.id).to_dict()})
+    except Exception as e:
+        return _err(rid, 5061, str(e))
+
+
+@method("projects.archive")
+def _(rid, params: dict) -> dict:
+    try:
+        from hermes_cli import projects_db as pdb
+
+        pid = str(params.get("id") or "")
+        with pdb.connect_closing() as conn:
+            proj = pdb.get_project(conn, pid)
+            if proj is None:
+                return _err(rid, 5062, "no such project")
+            if params.get("restore"):
+                pdb.restore_project(conn, proj.id)
+            else:
+                pdb.archive_project(conn, proj.id)
+            return _ok(rid, _projects_payload(conn))
+    except Exception as e:
+        return _err(rid, 5061, str(e))
+
+
+@method("projects.delete")
+def _(rid, params: dict) -> dict:
+    try:
+        from hermes_cli import projects_db as pdb
+
+        pid = str(params.get("id") or "")
+        with pdb.connect_closing() as conn:
+            proj = pdb.get_project(conn, pid)
+            if proj is None:
+                return _err(rid, 5062, "no such project")
+            pdb.delete_project(conn, proj.id)
+            return _ok(rid, _projects_payload(conn))
+    except Exception as e:
+        return _err(rid, 5061, str(e))
+
+
+@method("projects.set_active")
+def _(rid, params: dict) -> dict:
+    try:
+        from hermes_cli import projects_db as pdb
+
+        pid = params.get("id")
+        with pdb.connect_closing() as conn:
+            if pid:
+                proj = pdb.get_project(conn, str(pid))
+                if proj is None:
+                    return _err(rid, 5062, "no such project")
+                pdb.set_active(conn, proj.id)
+            else:
+                pdb.set_active(conn, None)
+            return _ok(rid, {"active_id": pdb.get_active_id(conn)})
+    except Exception as e:
+        return _err(rid, 5061, str(e))
+
+
+@method("projects.for_cwd")
+def _(rid, params: dict) -> dict:
+    try:
+        from hermes_cli import projects_db as pdb
+
+        raw = str(params.get("cwd") or "").strip()
+        cwd = _completion_cwd({"cwd": raw} if raw else {})
+        with pdb.connect_closing() as conn:
+            proj = pdb.project_for_path(conn, cwd)
+            return _ok(
+                rid,
+                {
+                    "project": proj.to_dict() if proj else None,
+                    "cwd": cwd,
+                    "branch": _git_branch_for_cwd(cwd),
+                },
+            )
+    except Exception as e:
+        return _err(rid, 5061, str(e))
 
 
 @method("config.get")

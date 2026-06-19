@@ -82,6 +82,33 @@ class TestSessionLifecycle:
     def test_get_nonexistent_session(self, db):
         assert db.get_session("nonexistent") is None
 
+    def test_update_session_cwd_persists_git_branch(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.update_session_cwd("s1", "/work/repo", git_branch="pets-feature")
+
+        session = db.get_session("s1")
+        assert session["cwd"] == "/work/repo"
+        assert session["git_branch"] == "pets-feature"
+
+    def test_update_session_cwd_empty_branch_does_not_clobber(self, db):
+        """A failed branch probe (empty string) must not wipe a branch we
+        already captured — only the cwd updates."""
+        db.create_session(session_id="s1", source="cli")
+        db.update_session_cwd("s1", "/work/repo", git_branch="main")
+        db.update_session_cwd("s1", "/work/repo", git_branch="")
+
+        session = db.get_session("s1")
+        assert session["git_branch"] == "main"
+
+    def test_update_session_cwd_without_branch_arg(self, db):
+        """Back-compat: callers that pass only (id, cwd) still work."""
+        db.create_session(session_id="s1", source="cli")
+        db.update_session_cwd("s1", "/work/repo")
+
+        session = db.get_session("s1")
+        assert session["cwd"] == "/work/repo"
+        assert session["git_branch"] is None
+
     def test_end_session(self, db):
         db.create_session(session_id="s1", source="cli")
         db.end_session("s1", end_reason="user_exit")

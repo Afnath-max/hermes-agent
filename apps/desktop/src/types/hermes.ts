@@ -310,6 +310,11 @@ export interface SessionCreateResponse {
 export interface SessionInfo {
   archived?: boolean
   cwd?: null | string
+  /** Git branch checked out in {@link cwd} when the session started/resumed.
+   *  The sidebar groups main-checkout sessions by this so feature-branch work
+   *  doesn't collapse under a single directory-named "main" row. Null for
+   *  non-git workspaces and sessions created before branch capture landed. */
+  git_branch?: null | string
   ended_at: null | number
   id: string
   /** Original root id of a compression chain, when this entry is a projected
@@ -518,6 +523,35 @@ export interface ProfileInfo {
 
 export interface ProfileSetupCommand {
   command: string
+}
+
+// ── Projects ───────────────────────────────────────────────────────────────
+// A first-class, per-profile, human-named workspace spanning one or more
+// folders. Mirrors hermes_cli/projects_db.Project.to_dict().
+export interface ProjectFolder {
+  path: string
+  label: null | string
+  is_primary: boolean
+  added_at: number
+}
+
+export interface ProjectInfo {
+  id: string
+  slug: string
+  name: string
+  description: null | string
+  icon: null | string
+  color: null | string
+  board_slug: null | string
+  primary_path: null | string
+  archived: boolean
+  created_at: number
+  folders: ProjectFolder[]
+}
+
+export interface ProjectsPayload {
+  projects: ProjectInfo[]
+  active_id: null | string
 }
 
 export interface ProfileSoul {
