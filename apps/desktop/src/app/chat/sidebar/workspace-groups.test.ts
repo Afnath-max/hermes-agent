@@ -335,8 +335,24 @@ describe('projectTreeFor', () => {
 
   it('promotes unowned git repos to auto-projects and omits cwd-less sessions', () => {
     const project = makeProject('App', ['/www/app'])
+    const resolver: WorktreeResolver = cwd => {
+      if (cwd === '/www/app') {
+        return info({ isMainWorktree: true, repoRoot: '/www/app', worktreeRoot: '/www/app' })
+      }
 
-    const tree = projectTreeFor([makeSession('/www/app'), makeSession('/elsewhere/thing'), makeSession(null)], [project], 'No workspace')
+      if (cwd === '/elsewhere/thing') {
+        return info({ isMainWorktree: true, repoRoot: '/elsewhere/thing', worktreeRoot: '/elsewhere/thing' })
+      }
+
+      return null
+    }
+
+    const tree = projectTreeFor(
+      [makeSession('/www/app'), makeSession('/elsewhere/thing'), makeSession(null)],
+      [project],
+      'No workspace',
+      resolver
+    )
 
     // Explicit project keeps its owned session.
     expect(tree.find(node => node.label === 'App')?.sessionCount).toBe(1)
@@ -349,23 +365,79 @@ describe('projectTreeFor', () => {
     expect(tree.some(node => node.isNoProject)).toBe(false)
   })
 
+  it('assigns linked-worktree sessions to explicit projects by repoRoot', () => {
+    const project = makeProject('Hermes', ['/www/hermes-agent'])
+    const resolver: WorktreeResolver = cwd => {
+      if (cwd === '/www/hermes-agent-wt-feature') {
+        return info({
+          branch: 'feature',
+          isMainWorktree: false,
+          repoRoot: '/www/hermes-agent',
+          worktreeRoot: '/www/hermes-agent-wt-feature'
+        })
+      }
+
+      return null
+    }
+
+    const tree = projectTreeFor([makeSession('/www/hermes-agent-wt-feature')], [project], 'No workspace', resolver)
+
+    // Worktree session folds into the explicit project (via repoRoot), so no
+    // standalone auto-project appears for the sibling worktree path.
+    expect(tree).toHaveLength(1)
+    expect(tree[0].label).toBe('Hermes')
+    expect(tree[0].isAuto).toBeFalsy()
+    expect(tree[0].sessionCount).toBe(1)
+    expect(tree[0].repos[0]?.label).toBe('hermes-agent')
+  })
+
   it('never emits a No-project bucket even when only cwd-less sessions exist', () => {
     const tree = projectTreeFor([makeSession(null), makeSession(null)], [], 'No workspace')
 
     expect(tree).toHaveLength(0)
   })
 
-  it('auto-projects appear with no explicit projects at all', () => {
-    const tree = projectTreeFor([makeSession('/www/repo-a'), makeSession('/www/repo-b')], [], 'No workspace')
+  it('auto-projects appear with no explicit projects when resolver exposes git roots', () => {
+    const resolver: WorktreeResolver = cwd => {
+      if (cwd === '/www/repo-a') {
+        return info({ isMainWorktree: true, repoRoot: '/www/repo-a', worktreeRoot: '/www/repo-a' })
+      }
+
+      if (cwd === '/www/repo-b') {
+        return info({ isMainWorktree: true, repoRoot: '/www/repo-b', worktreeRoot: '/www/repo-b' })
+      }
+
+      return null
+    }
+
+    const tree = projectTreeFor([makeSession('/www/repo-a'), makeSession('/www/repo-b')], [], 'No workspace', resolver)
 
     expect(tree).toHaveLength(2)
     expect(tree.every(node => node.isAuto)).toBe(true)
     expect(tree.map(node => node.label).sort()).toEqual(['repo-a', 'repo-b'])
   })
 
+  it('does not promote non-git folders to auto-projects', () => {
+    const tree = projectTreeFor([makeSession('/www/random-dir')], [], 'No workspace')
+
+    expect(tree).toHaveLength(0)
+  })
+
   it('explicit projects sort ahead of auto-projects', () => {
     const project = makeProject('App', ['/www/app'])
-    const tree = projectTreeFor([makeSession('/www/app'), makeSession('/www/other')], [project], 'No workspace')
+    const resolver: WorktreeResolver = cwd => {
+      if (cwd === '/www/app') {
+        return info({ isMainWorktree: true, repoRoot: '/www/app', worktreeRoot: '/www/app' })
+      }
+
+      if (cwd === '/www/other') {
+        return info({ isMainWorktree: true, repoRoot: '/www/other', worktreeRoot: '/www/other' })
+      }
+
+      return null
+    }
+
+    const tree = projectTreeFor([makeSession('/www/app'), makeSession('/www/other')], [project], 'No workspace', resolver)
 
     expect(tree[0].label).toBe('App')
     expect(tree[0].isAuto).toBeFalsy()

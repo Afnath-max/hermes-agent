@@ -1378,6 +1378,13 @@ class TestCounts:
         assert db.session_count(source="cli") == 2
         assert db.session_count(source="telegram") == 1
 
+    def test_session_count_by_cwd_prefix(self, db):
+        db.create_session("s1", "cli", cwd="/repo")
+        db.create_session("s2", "cli", cwd="/repo-wt-feature")
+        db.create_session("s3", "cli", cwd="/repo/subdir")
+
+        assert db.session_count(cwd_prefix="/repo") == 2
+
     def test_message_count_total(self, db):
         assert db.message_count() == 0
         db.create_session(session_id="s1", source="cli")
@@ -2825,6 +2832,14 @@ class TestListSessionsRich:
         sessions = db.list_sessions_rich(source="cli")
         assert len(sessions) == 1
         assert sessions[0]["id"] == "s1"
+
+    def test_rich_list_cwd_prefix_filter(self, db):
+        db.create_session("s1", "cli", cwd="/repo")
+        db.create_session("s2", "cli", cwd="/repo/subdir")
+        db.create_session("s3", "cli", cwd="/repo-wt-feature")
+
+        sessions = db.list_sessions_rich(cwd_prefix="/repo")
+        assert [session["id"] for session in sessions] == ["s2", "s1"]
 
     def test_preview_newlines_collapsed(self, db):
         db.create_session("s1", "cli")

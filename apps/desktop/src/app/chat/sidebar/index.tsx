@@ -43,8 +43,8 @@ import {
   SidebarMenuItem
 } from '@/components/ui/sidebar'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Tip } from '@/components/ui/tooltip'
-import { searchSessions, type SessionInfo, type SessionSearchResult } from '@/hermes'
+import type { HermesGitWorktree } from '@/global'
+import { listSessions, searchSessions, type SessionInfo, type SessionSearchResult } from '@/hermes'
 import { useWorktreeInfo } from '@/hooks/use-worktree-info'
 import { useI18n } from '@/i18n'
 import { comboTokens } from '@/lib/keybinds/combo'
@@ -117,6 +117,7 @@ import {
 } from '@/store/projects'
 import {
   $cronSessions,
+  $currentCwd,
   $messagingPlatformTotals,
   $messagingSessions,
   $messagingTruncated,
@@ -126,7 +127,8 @@ import {
   $sessionsLoading,
   $sessionsTotal,
   $workingSessionIds,
-  sessionPinId
+  sessionPinId,
+  setCurrentCwd
 } from '@/store/session'
 
 import { type AppView, ARTIFACTS_ROUTE, MESSAGING_ROUTE, SKILLS_ROUTE } from '../../routes'
@@ -135,12 +137,13 @@ import type { SidebarNavItem } from '../../types'
 
 import { SidebarCronJobsSection } from './cron-jobs-section'
 import { SidebarLoadMoreRow } from './load-more-row'
-import { resolveManualSessionOrderIds } from './order'
+import { reconcileFreshFirst, resolveManualSessionOrderIds } from './order'
 import { ProfileRail } from './profile-switcher'
 import { ProjectDialog } from './project-dialog'
 import { SidebarSessionRow } from './session-row'
 import { VirtualSessionList } from './virtual-session-list'
 import {
+  mergeRepoWorktreeGroups,
   projectTreeFor,
   type SidebarProjectTree,
   type SidebarSessionGroup,
@@ -175,10 +178,7 @@ const SIDEBAR_NAV: SidebarNavItem[] = [
   { id: 'artifacts', label: '', icon: props => <Codicon name="files" {...props} />, route: ARTIFACTS_ROUTE }
 ]
 
-const WORKSPACE_PAGE = 5
-// ALL-profiles view: show only the latest N per profile up front to keep the
-// unified list scannable, then reveal/fetch more in N-sized steps on demand.
-const PROFILE_INITIAL_PAGE = 5
+const SIDEBAR_GROUP_PAGE = 5
 // Two modes via the `compact` height variant (styles.css):
 //   tall    → each section is shrink-0, capped, its own scroller; Sessions is flex-1.
 //   compact → COMPACT_FLAT drops the caps so the whole stack scrolls as one.
@@ -252,9 +252,17 @@ function ReorderableList({
 const countLabel = (loaded: number, total: number) => (total > loaded ? `${loaded}/${total}` : String(loaded))
 const sessionTime = (s: SessionInfo) => s.last_active || s.started_at || 0
 
+const pathListKey = (paths: string[]) =>
+  paths.map(path => path.trim()).filter(Boolean).sort((a, b) => a.localeCompare(b)).join('\n')
+
+const WORKSPACE_GRID = 'grid grid-cols-[minmax(0,1fr)] gap-px'
+
 // Every session in a project, across its repos/worktrees (order-agnostic).
 const projectSessions = (project: SidebarProjectTree): SessionInfo[] =>
   project.repos.flatMap(repo => repo.groups.flatMap(group => group.sessions))
+
+const projectTreeCwd = (project: SidebarProjectTree): null | string =>
+  project.path || project.repos.find(repo => repo.path)?.path || null
 
 const projectActivityTime = (project: SidebarProjectTree): number =>
   projectSessions(project).reduce((latest, s) => Math.max(latest, sessionTime(s)), 0)
@@ -262,6 +270,29 @@ const projectActivityTime = (project: SidebarProjectTree): number =>
 // The project's most-recent sessions, for the overview preview under each row.
 const latestProjectSessions = (project: SidebarProjectTree, limit: number): SessionInfo[] =>
   [...projectSessions(project)].sort((a, b) => sessionTime(b) - sessionTime(a)).slice(0, limit)
+
+function linkedWorktreePaths(
+  repos: SidebarWorkspaceTree[],
+  repoWorktrees: Record<string, HermesGitWorktree[]>
+): string[] {
+  const paths = new Set<string>()
+
+  for (const repo of repos) {
+    for (const group of repo.groups) {
+      if (!group.isMain && group.path) {
+        paths.add(group.path)
+      }
+    }
+
+    for (const worktree of repo.path ? (repoWorktrees[repo.path] ?? []) : []) {
+      if (!worktree.isMain && worktree.path) {
+        paths.add(worktree.path)
+      }
+    }
+  }
+
+  return [...paths]
+}
 
 function sortProjectsForOverview(projects: SidebarProjectTree[], activeProjectId: null | string): SidebarProjectTree[] {
   return [...projects].sort((a, b) => {
@@ -294,6 +325,120 @@ function sortProjectsForOverview(projects: SidebarProjectTree[], activeProjectId
 
     return a.label.localeCompare(b.label, undefined, { sensitivity: 'base' })
   })
+}
+
+// Project drill-in lanes are git-driven: source them from `git worktree list`
+// so linked worktrees still appear even when their sessions aren't in the
+// recents payload currently loaded in memory.
+function useRepoWorktreeMap(repoPaths: string[], enabled: boolean): Record<string, HermesGitWorktree[]> {
+  const [map, setMap] = useState<Record<string, HermesGitWorktree[]>>({})
+  const key = useMemo(() => pathListKey(repoPaths), [repoPaths])
+
+  useEffect(() => {
+    if (!enabled || !repoPaths.length) {
+      setMap({})
+
+      return
+    }
+
+    const git = window.hermesDesktop?.git
+
+    if (!git?.worktreeList) {
+      setMap({})
+
+      return
+    }
+
+    let cancelled = false
+
+    void Promise.all(
+      repoPaths.map(async repoPath => {
+        try {
+          const worktrees = await git.worktreeList(repoPath)
+
+          return [repoPath, worktrees] as const
+        } catch {
+          return [repoPath, []] as const
+        }
+      })
+    ).then(entries => {
+      if (cancelled) {
+        return
+      }
+
+      setMap(Object.fromEntries(entries))
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [enabled, key, repoPaths])
+
+  return map
+}
+
+// Per-lane session hydration: linked worktree rows pull their own recents by cwd
+// instead of depending on whatever happened to be in the global recents page.
+function useWorktreeLaneSessions(
+  lanePaths: string[],
+  enabled: boolean,
+  cacheKey: string
+): Record<string, SessionInfo[]> {
+  const [map, setMap] = useState<Record<string, SessionInfo[]>>({})
+  const cacheRef = useRef<{ data: Record<string, SessionInfo[]>; key: string }>({ data: {}, key: '' })
+
+  const laneKey = useMemo(() => pathListKey(lanePaths), [lanePaths])
+
+  useEffect(() => {
+    if (!enabled || !lanePaths.length) {
+      cacheRef.current = { data: {}, key: `${cacheKey}::disabled` }
+      setMap({})
+
+      return
+    }
+
+    const key = `${cacheKey}::${laneKey}`
+
+    if (cacheRef.current.key !== key) {
+      cacheRef.current = { data: {}, key }
+      setMap({})
+    }
+
+    const missing = lanePaths.filter(path => !(path in cacheRef.current.data))
+
+    if (!missing.length) {
+      return
+    }
+
+    let cancelled = false
+
+    void Promise.all(
+      missing.map(async path => {
+        try {
+          const page = await listSessions(80, 0, 'exclude', 'recent', { cwdPrefix: path })
+
+          return [path, page.sessions] as const
+        } catch {
+          return [path, []] as const
+        }
+      })
+    ).then(entries => {
+      if (cancelled) {
+        return
+      }
+
+      const next = { ...cacheRef.current.data, ...Object.fromEntries(entries) }
+
+      cacheRef.current = { data: next, key }
+      setMap(next)
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [enabled, laneKey, lanePaths, cacheKey])
+
+  return map
 }
 
 function orderByIds<T>(items: T[], getId: (item: T) => string, orderIds: string[]): T[] {
@@ -333,16 +478,7 @@ function reconcileOrderIds(currentIds: string[], orderIds: string[]): string[] {
     return currentIds
   }
 
-  const current = new Set(currentIds)
-  const retained = orderIds.filter(id => current.has(id))
-  const retainedSet = new Set(retained)
-
-  // New ids (absent from the saved order) are the newest sessions/groups; keep
-  // them ahead of the persisted order so fresh activity surfaces at the top of
-  // the sidebar rather than being appended to the bottom.
-  const fresh = currentIds.filter(id => !retainedSet.has(id))
-
-  return [...fresh, ...retained]
+  return reconcileFreshFirst(currentIds, orderIds)
 }
 
 function sameIds(left: string[], right: string[]) {
@@ -406,7 +542,7 @@ function useSortableBindings(id: string) {
 interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
   currentView: AppView
   onNavigate: (item: SidebarNavItem) => void
-  onLoadMoreSessions: () => void
+  onLoadMoreSessions: () => Promise<void> | void
   onLoadMoreProfileSessions?: (profile: string) => Promise<void> | void
   onLoadMoreMessaging?: (platform: string) => Promise<void> | void
   onResumeSession: (sessionId: string) => void
@@ -469,12 +605,14 @@ export function ChatSidebar({
   const projects = useStore($projects)
   const activeProjectId = useStore($activeProjectId)
   const projectScope = useStore($projectScope)
+  const currentCwd = useStore($currentCwd)
   const dismissedAutoProjects = useStore($dismissedAutoProjectIds)
   const [searchQuery, setSearchQuery] = useState('')
   const [serverMatches, setServerMatches] = useState<SessionSearchResult[]>([])
   const [newSessionKbdFlash, setNewSessionKbdFlash] = useState(false)
   const [profileLoadMorePending, setProfileLoadMorePending] = useState<Record<string, boolean>>({})
   const [messagingLoadMorePending, setMessagingLoadMorePending] = useState<Record<string, boolean>>({})
+  const [recentsLoadMorePending, setRecentsLoadMorePending] = useState(false)
   const messagingOpenIds = useStore($sidebarMessagingOpenIds)
   // Per-platform count of rows currently revealed (starts at NON_SESSION_INITIAL_ROWS).
   const [messagingVisible, setMessagingVisible] = useState<Record<string, number>>({})
@@ -666,7 +804,10 @@ export function ChatSidebar({
   // path-name heuristic inside workspaceTreeFor. Parents reorder via
   // workspaceParentOrderIds; worktrees within a parent via workspaceOrderIds.
   const worktreeGroupingActive = agentsGrouped && !showAllProfiles
-  const worktreeResolver = useWorktreeInfo(agentSessions, worktreeGroupingActive)
+  // Resolve git identity for every single-profile view (cached per cwd), not
+  // just when grouped — project membership must be identical whether the
+  // sidebar is showing the overview or the flat list.
+  const worktreeResolver = useWorktreeInfo(agentSessions, !showAllProfiles)
 
   // Keep the project catalog fresh while the grouped view is active. Projects
   // are the new outermost grouping level; the fetch is best-effort and leaves
@@ -687,6 +828,9 @@ export function ChatSidebar({
     [workspaceParentOrderIds, workspaceOrderIds]
   )
 
+  // Render-only fallback for the degenerate grouped case where the project model
+  // is empty (no projects, only cwd-less sessions). NEVER a membership source —
+  // scoping is decided solely by projectModel below.
   const agentTree = useMemo<SidebarWorkspaceTree[] | undefined>(() => {
     if (!worktreeGroupingActive) {
       return undefined
@@ -695,34 +839,45 @@ export function ChatSidebar({
     return orderRepos(workspaceTreeFor(agentSessions, s.noWorkspace, worktreeResolver))
   }, [worktreeGroupingActive, agentSessions, s.noWorkspace, worktreeResolver, orderRepos])
 
-  // The project overview: explicit (user-created) projects + auto-projects
-  // derived from git repos / dirs in the session cwds (the old workspace logic,
-  // now first-class). Dismissed auto-projects are filtered out, then ordered
-  // like git clients: active explicit first, explicit before auto, recent first.
-  const agentProjectTree = useMemo<SidebarProjectTree[] | undefined>(() => {
-    if (!worktreeGroupingActive) {
-      return undefined
+  // ── Projects: the single top-level model ──────────────────────────────────
+  // Repos and user-created projects are the SAME concept — both are projects,
+  // 1:1. projectTreeFor unifies them (explicit first, then auto-detected repos).
+  // This is computed once for every single-profile view and EVERYTHING derives
+  // from it: the overview, the entered-project drill-in, and which sessions are
+  // "scoped" (and so excluded from the flat, project-less recents list). No view
+  // recomputes membership independently, so there are no top-level gaps.
+  const projectModel = useMemo<SidebarProjectTree[]>(() => {
+    if (showAllProfiles) {
+      return []
     }
 
     const dismissed = new Set(dismissedAutoProjects)
-    const tree = projectTreeFor(agentSessions, projects, s.noWorkspace, worktreeResolver)
 
     return sortProjectsForOverview(
-      tree
-      .filter(node => !(node.isAuto && dismissed.has(node.id)))
-      .map(project => ({ ...project, repos: orderRepos(project.repos) })),
+      projectTreeFor(agentSessions, projects, s.noWorkspace, worktreeResolver)
+        .filter(node => !(node.isAuto && dismissed.has(node.id)))
+        .map(project => ({ ...project, repos: orderRepos(project.repos) })),
       activeProjectId
     )
-  }, [
-    worktreeGroupingActive,
-    agentSessions,
-    projects,
-    dismissedAutoProjects,
-    s.noWorkspace,
-    worktreeResolver,
-    orderRepos,
-    activeProjectId
-  ])
+  }, [showAllProfiles, agentSessions, projects, dismissedAutoProjects, s.noWorkspace, worktreeResolver, orderRepos, activeProjectId])
+
+  // Sessions claimed by any project (repo or user-created) — the inverse is the
+  // flat, project-less recents list.
+  const scopedSessionIds = useMemo(() => {
+    const ids = new Set<string>()
+
+    for (const project of projectModel) {
+      for (const session of projectSessions(project)) {
+        ids.add(session.id)
+      }
+    }
+
+    return ids
+  }, [projectModel])
+
+  // The overview only renders in grouped mode; the model stays live regardless
+  // so scoping is consistent across views.
+  const agentProjectTree = worktreeGroupingActive ? projectModel : undefined
 
   // ── Project switcher (drill-in) ────────────────────────────────────────────
   // Grouped, single-profile view is a project switcher: ALL_PROJECTS shows the
@@ -737,6 +892,55 @@ export function ChatSidebar({
 
   const inProject = Boolean(enteredProject)
 
+  const scopedRepoPaths = useMemo(
+    () =>
+      inProject && enteredProject
+        ? enteredProject.repos.map(repo => repo.path).filter((path): path is string => Boolean(path))
+        : [],
+    [inProject, enteredProject]
+  )
+
+  const scopedRepoWorktrees = useRepoWorktreeMap(scopedRepoPaths, Boolean(inProject && enteredProject && !showAllProfiles))
+
+  const scopedLinkedLanePaths = useMemo(
+    () => (inProject && enteredProject ? linkedWorktreePaths(enteredProject.repos, scopedRepoWorktrees) : []),
+    [inProject, enteredProject, scopedRepoWorktrees]
+  )
+
+  const scopedLaneSessions = useWorktreeLaneSessions(
+    scopedLinkedLanePaths,
+    Boolean(inProject && enteredProject && !showAllProfiles),
+    profileScope
+  )
+
+  const lastProjectCwdSyncRef = useRef<null | string>(null)
+
+  const syncProjectCwd = useCallback(
+    (project: SidebarProjectTree) => {
+      const target = projectTreeCwd(project)
+
+      if (target && target !== currentCwd) {
+        setCurrentCwd(target)
+      }
+    },
+    [currentCwd]
+  )
+
+  useEffect(() => {
+    if (!inProject || !enteredProject) {
+      lastProjectCwdSyncRef.current = null
+
+      return
+    }
+
+    if (lastProjectCwdSyncRef.current === enteredProject.id) {
+      return
+    }
+
+    syncProjectCwd(enteredProject)
+    lastProjectCwdSyncRef.current = enteredProject.id
+  }, [inProject, enteredProject, syncProjectCwd])
+
   // A persisted scope can go stale (project archived/removed, or a profile
   // switch swapped the whole catalog). Once projects have loaded, drop back to
   // the overview if the scoped id is gone.
@@ -747,10 +951,23 @@ export function ChatSidebar({
   }, [projectScope, projectsActive, enteredProject])
 
   // The project overview (drill-in list) vs. the entered project's flattened
-  // content. With grouping on but nothing to group (no sessions, no projects),
-  // fall back to the bare repo tree so the empty state still resolves.
+  // content. Only when there are zero projects does the bare repo tree render,
+  // so the empty/cwd-less case still resolves (render fallback, not scoping).
   const projectOverview = projectsActive && !inProject ? agentProjectTree : undefined
   const fallbackTree = projectsActive ? undefined : agentTree
+
+  const onEnterProject = useCallback(
+    (id: string) => {
+      const project = projectModel.find(node => node.id === id)
+
+      if (project) {
+        syncProjectCwd(project)
+      }
+
+      enterProject(id)
+    },
+    [projectModel, syncProjectCwd]
+  )
 
   // The Sessions section is a project switcher in grouped mode: its label reads
   // "Sessions" when flat, "Projects" at the overview, and the project's name
@@ -758,34 +975,33 @@ export function ChatSidebar({
   const sessionsLabel =
     inProject && enteredProject ? enteredProject.label : worktreeGroupingActive ? s.projects.sectionLabel : s.sessions
 
-  const loadMoreForProfileGroup = useCallback(
-    (profile: string) => {
-      if (!onLoadMoreProfileSessions) {
+  const runKeyedLoad = useCallback(
+    (
+      key: string,
+      load: ((key: string) => Promise<void> | void) | undefined,
+      setPending: React.Dispatch<React.SetStateAction<Record<string, boolean>>>
+    ) => {
+      if (!load) {
         return
       }
 
-      setProfileLoadMorePending(prev => ({ ...prev, [profile]: true }))
+      setPending(prev => ({ ...prev, [key]: true }))
 
-      void Promise.resolve(onLoadMoreProfileSessions(profile))
+      void Promise.resolve(load(key))
         .catch(() => undefined)
-        .finally(() => setProfileLoadMorePending(({ [profile]: _done, ...rest }) => rest))
+        .finally(() => setPending(({ [key]: _done, ...rest }) => rest))
     },
-    [onLoadMoreProfileSessions]
+    []
+  )
+
+  const loadMoreForProfileGroup = useCallback(
+    (profile: string) => runKeyedLoad(profile, onLoadMoreProfileSessions, setProfileLoadMorePending),
+    [onLoadMoreProfileSessions, runKeyedLoad]
   )
 
   const loadMoreForMessaging = useCallback(
-    (platform: string) => {
-      if (!onLoadMoreMessaging) {
-        return
-      }
-
-      setMessagingLoadMorePending(prev => ({ ...prev, [platform]: true }))
-
-      void Promise.resolve(onLoadMoreMessaging(platform))
-        .catch(() => undefined)
-        .finally(() => setMessagingLoadMorePending(({ [platform]: _done, ...rest }) => rest))
-    },
-    [onLoadMoreMessaging]
+    (platform: string) => runKeyedLoad(platform, onLoadMoreMessaging, setMessagingLoadMorePending),
+    [onLoadMoreMessaging, runKeyedLoad]
   )
 
   // Reveal another batch of a platform's rows; fetch from the backend too if we
@@ -889,7 +1105,12 @@ export function ChatSidebar({
     sessionProfileTotals
   ])
 
-  const displayAgentSessions = agentSessions
+  // The flat recents list is everything NOT claimed by a project — loose,
+  // cwd-less, or unplaceable sessions (see scopedSessionIds, the single source).
+  const displayAgentSessions = useMemo(
+    () => (scopedSessionIds.size ? agentSessions.filter(session => !scopedSessionIds.has(session.id)) : agentSessions),
+    [agentSessions, scopedSessionIds]
+  )
 
   // Pagination is scope-aware. In "All profiles" mode it tracks the global
   // unified set. When scoped to one profile it must compare that profile's own
@@ -906,9 +1127,50 @@ export function ChatSidebar({
   )
 
   const hasMoreSessions = knownSessionTotal > loadedSessionCount
-  const remainingSessionCount = Math.max(0, knownSessionTotal - loadedSessionCount)
 
-  const recentsMeta = countLabel(agentSessions.length, knownSessionTotal)
+  const recentsMeta = countLabel(displayAgentSessions.length, knownSessionTotal)
+  const displayRecentsCountRef = useRef(0)
+  const loadedRecentsCountRef = useRef(0)
+  displayRecentsCountRef.current = displayAgentSessions.length
+  loadedRecentsCountRef.current = loadedSessionCount
+
+  const onLoadMoreRecents = useCallback(async () => {
+    if (recentsLoadMorePending) {
+      return
+    }
+
+    setRecentsLoadMorePending(true)
+
+    try {
+      const startVisible = displayRecentsCountRef.current
+      const targetVisible = startVisible + SIDEBAR_SESSIONS_PAGE_SIZE
+      let lastLoaded = loadedRecentsCountRef.current
+
+      // Project-less recents can be sparse in the global recent stream (because
+      // project-scoped sessions are filtered out in the UI). Keep paging until
+      // we actually reveal a full page of visible rows, or the backend window
+      // stops growing.
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        await Promise.resolve(onLoadMoreSessions())
+        await new Promise<void>(resolve => window.requestAnimationFrame(() => resolve()))
+
+        const visibleNow = displayRecentsCountRef.current
+        const loadedNow = loadedRecentsCountRef.current
+
+        if (visibleNow >= targetVisible) {
+          break
+        }
+
+        if (loadedNow <= lastLoaded) {
+          break
+        }
+
+        lastLoaded = loadedNow
+      }
+    } finally {
+      setRecentsLoadMorePending(false)
+    }
+  }, [onLoadMoreSessions, recentsLoadMorePending])
 
   const displayAgentGroups = showAllProfiles ? profileGroups : undefined
 
@@ -1164,21 +1426,18 @@ export function ChatSidebar({
                   // header; the global footer only applies to non-ALL views.
                   !showAllProfiles && !agentsGrouped && !showSessionSkeletons && hasMoreSessions ? (
                     <SidebarLoadMoreRow
-                      loading={sessionsLoading}
-                      onClick={onLoadMoreSessions}
-                      step={Math.min(SIDEBAR_SESSIONS_PAGE_SIZE, remainingSessionCount)}
+                      loading={sessionsLoading || recentsLoadMorePending}
+                      onClick={() => void onLoadMoreRecents()}
+                      // Recents are post-filtered to non-project sessions, so a
+                      // backend page size (50) is not a truthful "rows you'll
+                      // see" count. Use the generic label instead of a fake N.
+                      step={0}
                     />
                   ) : null
                 }
                 forceEmptyState={showSessionSkeletons}
                 groups={displayAgentGroups}
                 headerAction={
-                  // The flush-right slot is a STABLE navigation control across
-                  // both states: in the overview it's the group/ungroup toggle,
-                  // inside a project it's "back to overview" — same icon, same
-                  // position, so clicking it toggles scope without the target
-                  // ever moving. Scope-specific actions (new project / new
-                  // worktree + menu) sit to its left.
                   inProject && enteredProject ? (
                     <div className="group/workspace flex shrink-0 items-center gap-0.5">
                       {enteredProject.path && (
@@ -1191,60 +1450,59 @@ export function ChatSidebar({
                         scoped
                       />
                       <div className="grid size-6 place-items-center">
-                        <Tip label={s.showProjects}>
-                          <Button
-                            aria-label={s.showProjects}
-                            className={HEADER_NAV_BTN}
-                            onClick={event => {
-                              event.stopPropagation()
-                              exitProjectScope()
-                            }}
-                            size="icon-xs"
-                            variant="ghost"
-                          >
-                            <Codicon name="list-unordered" size="0.75rem" />
-                          </Button>
-                        </Tip>
+                        <Button
+                          aria-label={s.showProjects}
+                          className={HEADER_NAV_BTN}
+                          onClick={event => {
+                            event.stopPropagation()
+                            exitProjectScope()
+                          }}
+                          size="icon-xs"
+                          variant="ghost"
+                        >
+                          <Codicon name="list-unordered" size="0.75rem" />
+                        </Button>
                       </div>
                     </div>
                   ) : (
                     <div className="flex shrink-0 items-center gap-0.5">
-                      {!showAllProfiles && agentsGrouped ? (
-                        <Tip label={s.projects.newButton}>
+                      {!showAllProfiles ? (
+                        <Button
+                          aria-label={agentsGrouped ? s.projects.newButton : s.nav['new-session']}
+                          className={HEADER_ACTION_BTN}
+                          onClick={event => {
+                            event.stopPropagation()
+
+                            if (agentsGrouped) {
+                              openProjectCreate()
+                            } else {
+                              onNewSessionInWorkspace(null)
+                            }
+                          }}
+                          size="icon-xs"
+                          variant="ghost"
+                        >
+                          <Codicon name="add" size="0.75rem" />
+                        </Button>
+                      ) : null}
+                      <div className="grid size-6 place-items-center">
+                        {!showAllProfiles && agentSessions.length > 0 ? (
                           <Button
-                            aria-label={s.projects.newButton}
-                            className={HEADER_ACTION_BTN}
+                            aria-label={agentsGrouped ? s.showSessions : s.showProjects}
+                            className={cn(
+                              HEADER_NAV_BTN,
+                              agentsGrouped && 'bg-(--ui-control-active-background) text-foreground opacity-100'
+                            )}
                             onClick={event => {
                               event.stopPropagation()
-                              openProjectCreate()
+                              setSidebarRecentsOpen(true)
+                              setSidebarAgentsGrouped(!agentsGrouped)
                             }}
                             size="icon-xs"
                             variant="ghost"
                           >
-                            <Codicon name="add" size="0.75rem" />
+                            <Codicon name={agentsGrouped ? 'list-unordered' : 'root-folder'} size="0.75rem" />
                           </Button>
-                        </Tip>
-                      ) : null}
-                      <div className="grid size-6 place-items-center">
-                        {!showAllProfiles && agentSessions.length > 0 ? (
-                          <Tip label={agentsGrouped ? s.showSessions : s.showProjects}>
-                            <Button
-                              aria-label={agentsGrouped ? s.showSessions : s.showProjects}
-                              className={cn(
-                                HEADER_NAV_BTN,
-                                agentsGrouped && 'bg-(--ui-control-active-background) text-foreground opacity-100'
-                              )}
-                              onClick={event => {
-                                event.stopPropagation()
-                                setSidebarRecentsOpen(true)
-                                setSidebarAgentsGrouped(!agentsGrouped)
-                              }}
-                              size="icon-xs"
-                              variant="ghost"
-                            >
-                              <Codicon name={agentsGrouped ? 'list-unordered' : 'root-folder'} size="0.75rem" />
-                            </Button>
-                          </Tip>
                         ) : null}
                       </div>
                     </div>
@@ -1254,7 +1512,7 @@ export function ChatSidebar({
                 labelMeta={worktreeGroupingActive ? undefined : recentsMeta}
                 onArchiveSession={onArchiveSession}
                 onDeleteSession={onDeleteSession}
-                onEnterProject={enterProject}
+                onEnterProject={onEnterProject}
                 onNewSessionInWorkspace={showAllProfiles ? undefined : onNewSessionInWorkspace}
                 onReorderParents={showAllProfiles ? undefined : reorderParents}
                 onReorderSessions={showAllProfiles ? undefined : reorderSessions}
@@ -1265,7 +1523,9 @@ export function ChatSidebar({
                 open={agentsOpen}
                 pinned={false}
                 projectContent={inProject ? enteredProject : undefined}
+                projectLaneSessions={inProject ? scopedLaneSessions : undefined}
                 projectOverview={projectOverview}
+                projectRepoWorktrees={inProject ? scopedRepoWorktrees : undefined}
                 rootClassName={cn(
                   'min-h-32 flex-1 overflow-hidden p-0',
                   !recentsVirtualizes && 'compact:min-h-0 compact:flex-none compact:overflow-visible'
@@ -1469,6 +1729,10 @@ interface SidebarSessionsSectionProps {
   // The entered project's flattened content: main-checkout sessions render
   // directly (no redundant repo/branch header); only linked worktrees nest.
   projectContent?: SidebarProjectTree
+  // Live git lanes (`git worktree list`) for repos in the entered project.
+  projectRepoWorktrees?: Record<string, HermesGitWorktree[]>
+  // Per-linked-worktree recents keyed by worktree path.
+  projectLaneSessions?: Record<string, SessionInfo[]>
   activeProjectId?: null | string
   labelMeta?: React.ReactNode
   labelIcon?: React.ReactNode
@@ -1508,6 +1772,8 @@ function SidebarSessionsSection({
   projectOverview,
   onEnterProject,
   projectContent,
+  projectRepoWorktrees,
+  projectLaneSessions,
   activeProjectId,
   labelMeta,
   labelIcon,
@@ -1574,42 +1840,30 @@ function SidebarSessionsSection({
     inner = emptyState
   } else if (projectContent) {
     inner = (
-      <EnteredProjectContent onNewSession={onNewSessionInWorkspace} project={projectContent} renderRows={renderRows} />
+      <EnteredProjectContent
+        laneSessions={projectLaneSessions}
+        onNewSession={onNewSessionInWorkspace}
+        project={projectContent}
+        renderRows={renderRows}
+        repoWorktrees={projectRepoWorktrees}
+      />
     )
   } else if (projectOverview?.length) {
     const explicit = projectOverview.filter(project => !project.isAuto)
     const auto = projectOverview.filter(project => project.isAuto)
 
-    const rows = (items: SidebarProjectTree[]) =>
-      items.map(project => (
-        <ProjectOverviewRow
-          activeProjectId={activeProjectId}
-          key={project.id}
-          onEnter={onEnterProject}
-          onNewSession={onNewSessionInWorkspace}
-          project={project}
-          renderRows={renderRows}
-        />
-      ))
-
-    // Git-client flow: saved projects first, discovered repos second. Section
-    // labels only appear when both are present to keep noise low.
-    inner = (
-      <>
-        {explicit.length > 0 && (
-          <>
-            {auto.length > 0 && <ProjectOverviewSectionTitle label="Projects" />}
-            {rows(explicit)}
-          </>
-        )}
-        {auto.length > 0 && (
-          <>
-            {explicit.length > 0 && <ProjectOverviewSectionTitle label="Detected repositories" />}
-            {rows(auto)}
-          </>
-        )}
-      </>
-    )
+    // Saved projects first, discovered repos second — ordering carries the
+    // distinction; no section labels.
+    inner = [...explicit, ...auto].map(project => (
+      <ProjectOverviewRow
+        activeProjectId={activeProjectId}
+        key={project.id}
+        onEnter={onEnterProject}
+        onNewSession={onNewSessionInWorkspace}
+        project={project}
+        renderRows={renderRows}
+      />
+    ))
   } else if (tree?.length) {
     const parentNodes = tree.map(parent =>
       onReorderParents ? (
@@ -1730,8 +1984,7 @@ function SidebarWorkspaceGroup({
   const { t } = useI18n()
   const s = t.sidebar
   const isProfileGroup = group.mode === 'profile'
-  const isSourceGroup = group.mode === 'source'
-  const pageStep = isProfileGroup ? PROFILE_INITIAL_PAGE : WORKSPACE_PAGE
+  const pageStep = SIDEBAR_GROUP_PAGE
   const [open, toggleOpen] = useWorkspaceNodeOpen(group.id)
   const [visibleCount, setVisibleCount] = useState(pageStep)
 
@@ -1747,12 +2000,6 @@ function SidebarWorkspaceGroup({
   // worktree. When reorderable it doubles as the drag handle (icon ↔ grabber).
   const leadingIcon = group.color ? (
     <span aria-hidden="true" className="size-2 shrink-0 rounded-full" style={{ backgroundColor: group.color }} />
-  ) : isSourceGroup && group.sourceId ? (
-    <PlatformAvatar
-      className="size-4 rounded-[4px] text-[0.5625rem] [&_svg]:size-3"
-      platformId={group.sourceId}
-      platformName={group.label}
-    />
   ) : (
     <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="git-branch" size="0.75rem" />
   )
@@ -1801,19 +2048,17 @@ function SidebarWorkspaceGroup({
                 />
               )}
               {onRemove && (
-                <Tip label={s.projects.removeWorktree}>
-                  <button
-                    aria-label={s.projects.removeWorktree}
-                    className="grid size-4 shrink-0 place-items-center rounded-sm bg-transparent text-(--ui-text-quaternary) opacity-0 transition-opacity hover:bg-(--ui-control-hover-background) hover:text-destructive group-hover/workspace:opacity-100"
-                    onClick={event => {
-                      event.stopPropagation()
-                      onRemove()
-                    }}
-                    type="button"
-                  >
-                    <Codicon name="trash" size="0.75rem" />
-                  </button>
-                </Tip>
+                <button
+                  aria-label={s.projects.removeWorktree}
+                  className="grid size-4 shrink-0 place-items-center rounded-sm bg-transparent text-(--ui-text-quaternary) opacity-0 transition-opacity hover:bg-(--ui-control-hover-background) hover:text-destructive group-hover/workspace:opacity-100"
+                  onClick={event => {
+                    event.stopPropagation()
+                    onRemove()
+                  }}
+                  type="button"
+                >
+                  <Codicon name="trash" size="0.75rem" />
+                </button>
               )}
             </div>
           )
@@ -1841,7 +2086,7 @@ function SidebarWorkspaceGroup({
               <WorkspaceShowMoreButton
                 count={nextCount}
                 label={group.label}
-                onClick={() => setVisibleCount(count => count + WORKSPACE_PAGE)}
+                onClick={() => setVisibleCount(count => count + SIDEBAR_GROUP_PAGE)}
               />
             ))}
         </>
@@ -1893,7 +2138,7 @@ function SidebarWorkspaceParent({
   const { t } = useI18n()
   const s = t.sidebar
   const [open, toggleOpen] = useWorkspaceNodeOpen(parent.id)
-  const [visibleCount, setVisibleCount] = useState(WORKSPACE_PAGE)
+  const [visibleCount, setVisibleCount] = useState(SIDEBAR_GROUP_PAGE)
 
   // A repo with a single worktree has no second level worth showing: collapse it
   // to one row (repo header → its sessions directly), only nesting when there
@@ -1945,9 +2190,9 @@ function SidebarWorkspaceParent({
             {renderRows(visibleSessions)}
             {hiddenCount > 0 && (
               <WorkspaceShowMoreButton
-                count={Math.min(WORKSPACE_PAGE, hiddenCount)}
+                count={Math.min(SIDEBAR_GROUP_PAGE, hiddenCount)}
                 label={parent.label}
-                onClick={() => setVisibleCount(count => count + WORKSPACE_PAGE)}
+                onClick={() => setVisibleCount(count => count + SIDEBAR_GROUP_PAGE)}
               />
             )}
           </>
@@ -1986,23 +2231,11 @@ function SortableSidebarWorkspaceParent(props: SortableWorkspaceParentProps) {
 
 // Leading glyph shared by the overview row + scope banner.
 function projectIcon(project: SidebarProjectTree) {
-  if (project.isNoProject) {
-    return <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="circle-slash" size="0.75rem" />
-  }
-
   if (project.color) {
     return <span aria-hidden="true" className="size-2 shrink-0 rounded-full" style={{ backgroundColor: project.color }} />
   }
 
   return <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="folder-library" size="0.75rem" />
-}
-
-function ProjectOverviewSectionTitle({ label }: { label: string }) {
-  return (
-    <div className="px-2 pb-0.5 pt-2 text-[0.625rem] tracking-wide text-(--ui-text-tertiary) uppercase">
-      {label}
-    </div>
-  )
 }
 
 interface ProjectOverviewRowProps {
@@ -2022,7 +2255,7 @@ const PROJECT_PREVIEW_COUNT = 3
 function ProjectOverviewRow({ project, onEnter, onNewSession, renderRows, activeProjectId }: ProjectOverviewRowProps) {
   const { t } = useI18n()
   const s = t.sidebar
-  const isActive = !project.isNoProject && project.id === activeProjectId
+  const isActive = project.id === activeProjectId
   const preview = renderRows ? latestProjectSessions(project, PROJECT_PREVIEW_COUNT) : []
 
   return (
@@ -2044,10 +2277,10 @@ function ProjectOverviewRow({ project, onEnter, onNewSession, renderRows, active
             {project.label}
           </span>
         </button>
-        {onNewSession && !project.isNoProject && (
+        {onNewSession && (
           <WorkspaceAddButton label={s.newSessionIn(project.label)} onClick={() => onNewSession(project.path)} />
         )}
-        {!project.isNoProject && <ProjectMenu isActive={isActive} project={project} />}
+        <ProjectMenu isActive={isActive} project={project} />
       </div>
       {preview.length > 0 && (
         <div className="grid grid-cols-[minmax(0,1fr)] gap-px pb-1 pl-4">{renderRows?.(preview)}</div>
@@ -2063,11 +2296,15 @@ function ProjectOverviewRow({ project, onEnter, onNewSession, renderRows, active
 function EnteredProjectContent({
   project,
   renderRows,
-  onNewSession
+  onNewSession,
+  laneSessions,
+  repoWorktrees
 }: {
   project: SidebarProjectTree
   renderRows: (sessions: SessionInfo[]) => React.ReactNode
   onNewSession?: (path: null | string) => void
+  laneSessions?: Record<string, SessionInfo[]>
+  repoWorktrees?: Record<string, HermesGitWorktree[]>
 }) {
   if (!project.repos.length) {
     return null
@@ -2079,7 +2316,9 @@ function EnteredProjectContent({
     <>
       {project.repos.map(repo => (
         <RepoFlatSection
+          discoveredWorktrees={repo.path ? repoWorktrees?.[repo.path] : undefined}
           key={repo.id}
+          laneSessions={laneSessions}
           onNewSession={onNewSession}
           renderRows={renderRows}
           repo={repo}
@@ -2094,23 +2333,31 @@ function RepoFlatSection({
   repo,
   showHeader,
   renderRows,
-  onNewSession
+  onNewSession,
+  discoveredWorktrees,
+  laneSessions
 }: {
   repo: SidebarWorkspaceTree
   showHeader: boolean
   renderRows: (sessions: SessionInfo[]) => React.ReactNode
   onNewSession?: (path: null | string) => void
+  discoveredWorktrees?: HermesGitWorktree[]
+  laneSessions?: Record<string, SessionInfo[]>
 }) {
   const { t } = useI18n()
   const s = t.sidebar
   const [open, toggleOpen] = useWorkspaceNodeOpen(repo.id)
   const dismissedWorktrees = useStore($dismissedWorktreeIds)
 
-  // Each row is a branch: main-checkout branch groups (isMain — they share the
-  // repo's main checkout dir and can't be `git worktree remove`-d) keep their
-  // branch label, then linked worktrees (removable). Groups are already ordered
-  // main-first/trunk-first by workspaceTreeFor; we only filter dismissed ones.
-  const ordered = repo.groups.filter(group => group.isMain || !dismissedWorktrees.includes(group.id))
+  // Merge session-derived groups with live git lanes from `git worktree list`.
+  const mergedGroups = useMemo(
+    () => mergeRepoWorktreeGroups(repo, discoveredWorktrees, laneSessions),
+    [repo, discoveredWorktrees, laneSessions]
+  )
+
+  // Main lanes are always visible; linked worktrees can be user-dismissed.
+  const ordered = mergedGroups.filter(group => group.isMain || !dismissedWorktrees.includes(group.id))
+  const repoCount = ordered.reduce((sum, group) => sum + group.sessions.length, 0)
 
   const removeWorktree = async (group: SidebarSessionGroup) => {
     if (!repo.path || !group.path) {
@@ -2149,7 +2396,7 @@ function RepoFlatSection({
         action={
           onNewSession && <WorkspaceAddButton label={s.newSessionIn(repo.label)} onClick={() => onNewSession(repo.path)} />
         }
-        count={repo.sessionCount}
+        count={repoCount}
         emphasis
         icon={<Codicon className="shrink-0 text-(--ui-text-tertiary)" name="repo" size="0.75rem" />}
         label={repo.label}
@@ -2182,13 +2429,19 @@ function ProjectMenu({
   const { t } = useI18n()
   const p = t.sidebar.projects
   const target = { id: project.id, name: project.label }
+  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false)
 
-  const remove = () => {
-    if (project.isAuto) {
-      dismissAutoProject(project.id)
-    } else {
-      void deleteProject(project.id)
+  const removeAuto = () => {
+    dismissAutoProject(project.id)
+
+    if (scoped) {
+      onExitScope?.()
     }
+  }
+
+  const confirmDelete = () => {
+    void deleteProject(project.id)
+    setConfirmDeleteOpen(false)
 
     if (scoped) {
       onExitScope?.()
@@ -2196,55 +2449,82 @@ function ProjectMenu({
   }
 
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <button
-          aria-label={p.menu}
-          className={cn(
-            'grid size-4 shrink-0 place-items-center rounded-sm bg-transparent text-(--ui-text-quaternary) opacity-0 transition-opacity hover:bg-(--ui-control-hover-background) hover:text-foreground data-[state=open]:opacity-100',
-            // In the project header reveal on the whole header hover; in overview
-            // rows reveal on the row hover.
-            scoped ? 'group-hover/section:opacity-100' : 'group-hover/workspace:opacity-100'
+    <>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <button
+            aria-label={p.menu}
+            className={cn(
+              'grid size-4 shrink-0 place-items-center rounded-sm bg-transparent text-(--ui-text-quaternary) opacity-0 transition-opacity hover:bg-(--ui-control-hover-background) hover:text-foreground data-[state=open]:opacity-100',
+              // In the project header reveal on the whole header hover; in overview
+              // rows reveal on the row hover.
+              scoped ? 'group-hover/section:opacity-100' : 'group-hover/workspace:opacity-100'
+            )}
+            onClick={event => event.stopPropagation()}
+            type="button"
+          >
+            <Codicon name="kebab-vertical" size="0.75rem" />
+          </button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="w-48" sideOffset={6}>
+          {!project.isAuto && (
+            <>
+              <DropdownMenuItem onSelect={() => openProjectRename(target)}>
+                <Codicon name="edit" size="0.875rem" />
+                <span>{p.menuRename}</span>
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => openProjectAddFolder(target)}>
+                <Codicon name="new-folder" size="0.875rem" />
+                <span>{p.menuAddFolder}</span>
+              </DropdownMenuItem>
+              <DropdownMenuItem disabled={isActive} onSelect={() => void setActiveProject(project.id)}>
+                <Codicon name="target" size="0.875rem" />
+                <span>{p.menuSetActive}</span>
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+            </>
           )}
-          onClick={event => event.stopPropagation()}
-          type="button"
-        >
-          <Codicon name="kebab-vertical" size="0.75rem" />
-        </button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-48" sideOffset={6}>
-        {!project.isAuto && (
-          <>
-            <DropdownMenuItem onSelect={() => openProjectRename(target)}>
-              <Codicon name="edit" size="0.875rem" />
-              <span>{p.menuRename}</span>
+          <DropdownMenuItem disabled={!project.path} onSelect={() => void revealPath(project.path)}>
+            <Codicon name="folder-opened" size="0.875rem" />
+            <span>{p.reveal}</span>
+          </DropdownMenuItem>
+          <DropdownMenuItem disabled={!project.path} onSelect={() => void copyPath(project.path)}>
+            <Codicon name="copy" size="0.875rem" />
+            <span>{p.copyPath}</span>
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          {project.isAuto ? (
+            <DropdownMenuItem onSelect={removeAuto} variant="destructive">
+              <Codicon name="trash" size="0.875rem" />
+              <span>{p.removeFromSidebar}</span>
             </DropdownMenuItem>
-            <DropdownMenuItem onSelect={() => openProjectAddFolder(target)}>
-              <Codicon name="new-folder" size="0.875rem" />
-              <span>{p.menuAddFolder}</span>
+          ) : (
+            <DropdownMenuItem onSelect={() => setConfirmDeleteOpen(true)} variant="destructive">
+              <Codicon name="trash" size="0.875rem" />
+              <span>{`${p.menuDelete}…`}</span>
             </DropdownMenuItem>
-            <DropdownMenuItem disabled={isActive} onSelect={() => void setActiveProject(project.id)}>
-              <Codicon name="target" size="0.875rem" />
-              <span>{p.menuSetActive}</span>
-            </DropdownMenuItem>
-            <DropdownMenuSeparator />
-          </>
-        )}
-        <DropdownMenuItem disabled={!project.path} onSelect={() => void revealPath(project.path)}>
-          <Codicon name="folder-opened" size="0.875rem" />
-          <span>{p.reveal}</span>
-        </DropdownMenuItem>
-        <DropdownMenuItem disabled={!project.path} onSelect={() => void copyPath(project.path)}>
-          <Codicon name="copy" size="0.875rem" />
-          <span>{p.copyPath}</span>
-        </DropdownMenuItem>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={remove} variant="destructive">
-          <Codicon name="trash" size="0.875rem" />
-          <span>{p.removeFromSidebar}</span>
-        </DropdownMenuItem>
-      </DropdownMenuContent>
-    </DropdownMenu>
+          )}
+        </DropdownMenuContent>
+      </DropdownMenu>
+      <Dialog onOpenChange={setConfirmDeleteOpen} open={confirmDeleteOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{`${p.menuDelete} "${project.label}"?`}</DialogTitle>
+            <DialogDescription>
+              This removes the saved project from Hermes. Files, git repos, and worktrees stay untouched.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button onClick={() => setConfirmDeleteOpen(false)} variant="ghost">
+              Cancel
+            </Button>
+            <Button onClick={confirmDelete} variant="destructive">
+              {p.menuDelete}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
   )
 }
 
@@ -2258,16 +2538,14 @@ function WorkspaceShowMoreButton({ count, label, onClick }: { count: number; lab
   const text = t.sidebar.showMoreIn(count, label)
 
   return (
-    <Tip label={text}>
-      <button
-        aria-label={text}
-        className="ml-auto grid size-5 place-items-center rounded-sm bg-transparent text-(--ui-text-tertiary) transition-colors hover:bg-(--ui-control-hover-background) hover:text-foreground"
-        onClick={onClick}
-        type="button"
-      >
-        <Codicon name="ellipsis" size="0.75rem" />
-      </button>
-    </Tip>
+    <button
+      aria-label={text}
+      className="ml-auto grid size-5 place-items-center rounded-sm bg-transparent text-(--ui-text-tertiary) transition-colors hover:bg-(--ui-control-hover-background) hover:text-foreground"
+      onClick={onClick}
+      type="button"
+    >
+      <Codicon name="ellipsis" size="0.75rem" />
+    </button>
   )
 }
 
@@ -2316,16 +2594,14 @@ function WorkspaceReorderHandle({
 // "+" affordance shared by repo and worktree headers — reveals on header hover.
 function WorkspaceAddButton({ label, onClick }: { label: string; onClick: () => void }) {
   return (
-    <Tip label={label}>
-      <button
-        aria-label={label}
-        className="grid size-4 shrink-0 place-items-center rounded-sm bg-transparent text-(--ui-text-quaternary) opacity-0 transition-opacity hover:bg-(--ui-control-hover-background) hover:text-foreground group-hover/workspace:opacity-100"
-        onClick={onClick}
-        type="button"
-      >
-        <Codicon name="add" size="0.75rem" />
-      </button>
-    </Tip>
+    <button
+      aria-label={label}
+      className="grid size-4 shrink-0 place-items-center rounded-sm bg-transparent text-(--ui-text-quaternary) opacity-0 transition-opacity hover:bg-(--ui-control-hover-background) hover:text-foreground group-hover/workspace:opacity-100"
+      onClick={onClick}
+      type="button"
+    >
+      <Codicon name="add" size="0.75rem" />
+    </button>
   )
 }
 
@@ -2367,16 +2643,14 @@ function StartWorkButton({ repoPath, onStarted }: { repoPath: string; onStarted:
 
   return (
     <>
-      <Tip label={s.projects.startWork}>
-        <button
-          aria-label={s.projects.startWork}
-          className="grid size-4 shrink-0 place-items-center rounded-sm bg-transparent text-(--ui-text-quaternary) opacity-0 transition-opacity hover:bg-(--ui-control-hover-background) hover:text-foreground group-hover/section:opacity-100 focus-visible:opacity-100"
-          onClick={() => setOpen(true)}
-          type="button"
-        >
-          <Codicon name="git-branch" size="0.75rem" />
-        </button>
-      </Tip>
+      <button
+        aria-label={s.projects.startWork}
+        className="grid size-4 shrink-0 place-items-center rounded-sm bg-transparent text-(--ui-text-quaternary) opacity-0 transition-opacity hover:bg-(--ui-control-hover-background) hover:text-foreground group-hover/section:opacity-100 focus-visible:opacity-100"
+        onClick={() => setOpen(true)}
+        type="button"
+      >
+        <Codicon name="git-branch" size="0.75rem" />
+      </button>
       <Dialog onOpenChange={setOpen} open={open}>
         <DialogContent className="max-w-md">
           <DialogHeader>

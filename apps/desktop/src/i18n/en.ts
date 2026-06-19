@@ -1194,7 +1194,7 @@ export const en: Translations = {
       menuSave: 'Save as project',
       reveal: 'Reveal in folder',
       copyPath: 'Copy path',
-      removeFromSidebar: 'Remove from sidebar',
+      removeFromSidebar: 'Hide from sidebar',
       createFailed: 'Could not create project',
       startWork: 'New worktree',
       newWorktreeTitle: 'New worktree',

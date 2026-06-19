@@ -1,4 +1,4 @@
-import type { HermesWorktreeInfo } from '@/global'
+import type { HermesGitWorktree, HermesWorktreeInfo } from '@/global'
 import type { ProjectInfo, SessionInfo } from '@/hermes'
 
 export interface SidebarSessionGroup {
@@ -157,6 +157,27 @@ interface WorkspacePlacement {
 
 /** Default-branch names that sort first and read as the repo's trunk. */
 const TRUNK_BRANCHES = new Set(['main', 'master', 'trunk', 'develop'])
+
+export function compareWorktreeGroups(a: SidebarSessionGroup, b: SidebarSessionGroup): number {
+  if (Boolean(a.isMain) !== Boolean(b.isMain)) {
+    return a.isMain ? -1 : 1
+  }
+
+  if (a.isMain && b.isMain) {
+    const aTrunk = TRUNK_BRANCHES.has(a.label.toLowerCase())
+    const bTrunk = TRUNK_BRANCHES.has(b.label.toLowerCase())
+
+    if (aTrunk !== bTrunk) {
+      return aTrunk ? -1 : 1
+    }
+  }
+
+  return a.label.localeCompare(b.label, undefined, { sensitivity: 'base' })
+}
+
+export function sortWorktreeGroups(groups: SidebarSessionGroup[]): SidebarSessionGroup[] {
+  return [...groups].sort(compareWorktreeGroups)
+}
 
 /** Replace a path's final segment, preserving its prefix + separators. */
 const withBaseName = (path: string, name: string): string =>
@@ -344,22 +365,7 @@ export function workspaceTreeFor(
   // main/master ahead of feature branches, then alphabetical), then linked
   // worktrees. Keeps the trunk pinned to the top regardless of activity.
   for (const parent of parents.values()) {
-    parent.groups.sort((a, b) => {
-      if (Boolean(a.isMain) !== Boolean(b.isMain)) {
-        return a.isMain ? -1 : 1
-      }
-
-      if (a.isMain && b.isMain) {
-        const aTrunk = TRUNK_BRANCHES.has(a.label.toLowerCase())
-        const bTrunk = TRUNK_BRANCHES.has(b.label.toLowerCase())
-
-        if (aTrunk !== bTrunk) {
-          return aTrunk ? -1 : 1
-        }
-      }
-
-      return a.label.localeCompare(b.label, undefined, { sensitivity: 'base' })
-    })
+    parent.groups = sortWorktreeGroups(parent.groups)
   }
 
   const result = [...parents.values()]
@@ -447,6 +453,129 @@ export function projectForPath(projects: ProjectInfo[], cwd: string): ProjectInf
   return best
 }
 
+/** Longest-prefix project match against cwd and, when known, its git repoRoot. */
+export function projectForSession(
+  session: SessionInfo,
+  projects: ProjectInfo[],
+  resolver?: WorktreeResolver
+): ProjectInfo | null {
+  const cwd = (session.cwd || '').trim()
+
+  if (!cwd) {
+    return null
+  }
+
+  const info = resolver?.(cwd)
+  const candidates =
+    info?.repoRoot && info.repoRoot !== cwd ? [cwd, info.repoRoot] : [cwd]
+
+  let best: ProjectInfo | null = null
+  let bestLen = -1
+
+  for (const target of candidates) {
+    const match = projectForPath(projects, target)
+
+    if (!match) {
+      continue
+    }
+
+    for (const folder of match.folders) {
+      if (isPathUnder(folder.path, target)) {
+        const len = segments(folder.path).length
+
+        if (len > bestLen) {
+          bestLen = len
+          best = match
+        }
+      }
+    }
+  }
+
+  return best
+}
+
+/** Merge session groups with live `git worktree list` lanes and per-path recents. */
+export function mergeRepoWorktreeGroups(
+  repo: Pick<SidebarWorkspaceTree, 'groups' | 'id'>,
+  discoveredWorktrees?: HermesGitWorktree[],
+  laneSessions?: Record<string, SessionInfo[]>
+): SidebarSessionGroup[] {
+  const merged = [...repo.groups]
+  const seenIds = new Set(merged.map(group => group.id))
+  const seenPaths = new Set(merged.map(group => group.path).filter((path): path is string => Boolean(path)))
+  let hasMainGroup = merged.some(group => group.isMain)
+
+  for (const worktree of discoveredWorktrees ?? []) {
+    const wtPath = worktree.path?.trim()
+
+    if (!wtPath) {
+      continue
+    }
+
+    if (worktree.isMain) {
+      if (hasMainGroup) {
+        continue
+      }
+
+      const branch = (worktree.branch?.trim() || 'main').trim()
+      const id = `${repo.id}::branch::${branch}`
+
+      if (seenIds.has(id)) {
+        continue
+      }
+
+      merged.push({ id, isMain: true, label: branch, path: wtPath, sessions: [] })
+      seenIds.add(id)
+      seenPaths.add(wtPath)
+      hasMainGroup = true
+
+      continue
+    }
+
+    if (seenPaths.has(wtPath) || seenIds.has(wtPath)) {
+      continue
+    }
+
+    merged.push({
+      id: wtPath,
+      isMain: false,
+      label: worktree.branch?.trim() || baseName(wtPath) || wtPath,
+      path: wtPath,
+      sessions: []
+    })
+    seenIds.add(wtPath)
+    seenPaths.add(wtPath)
+  }
+
+  const hydrated = merged.map(group => {
+    if (group.isMain || !group.path) {
+      return group
+    }
+
+    const fetched = laneSessions?.[group.path]
+
+    if (!fetched?.length) {
+      return group
+    }
+
+    if (!group.sessions.length) {
+      return { ...group, sessions: fetched }
+    }
+
+    const byId = new Map(group.sessions.map(session => [session.id, session]))
+
+    for (const session of fetched) {
+      if (!byId.has(session.id)) {
+        byId.set(session.id, session)
+      }
+    }
+
+    return { ...group, sessions: [...byId.values()].sort((a, b) => b.started_at - a.started_at) }
+  })
+
+  return sortWorktreeGroups(hydrated)
+}
+
 /** A project node: human-named, holds the repo->worktree subtree for its sessions. */
 export interface SidebarProjectTree {
   id: string
@@ -455,8 +584,8 @@ export interface SidebarProjectTree {
   color?: null | string
   icon?: null | string
   archived?: boolean
-  // A git repo / directory promoted to a project automatically from session
-  // cwds (not a user-created entry in projects.db). Deletable = dismissable.
+  // A git repo root promoted automatically from session cwds (not a
+  // user-created entry in projects.db). Deletable = dismissable.
   isAuto?: boolean
   // The synthetic "No project" bucket for cwd-less sessions.
   isNoProject?: boolean
@@ -470,10 +599,10 @@ export interface SidebarProjectTree {
  * Three tiers, in order:
  *  1. **Explicit projects** (user-created, from projects.db) — always shown,
  *     even with zero sessions, so a freshly-created project is visible.
- *  2. **Auto projects** — every git repo / directory inferred from the
- *     remaining session cwds becomes its own project (the old "workspace"
- *     logic, now first-class). Flagged `isAuto` so the UI can offer
- *     delete-as-dismiss and "save as project".
+ *  2. **Auto projects** — every inferred git repo ROOT from the remaining
+ *     session cwds becomes its own project (never arbitrary folders).
+ *     Flagged `isAuto` so the UI can offer delete-as-dismiss and
+ *     "save as project".
  *
  * Sessions with no cwd belong to no project and are simply omitted from the
  * overview (they remain in the flat recents list and search) — there is no
@@ -492,8 +621,7 @@ export function projectTreeFor(
   const unowned: SessionInfo[] = []
 
   for (const session of sessions) {
-    const cwd = session.cwd?.trim() || ''
-    const project = cwd ? projectForPath(activeProjects, cwd) : null
+    const project = projectForSession(session, activeProjects, resolver)
 
     if (project) {
       const list = byProject.get(project.id) ?? []
@@ -522,21 +650,38 @@ export function projectTreeFor(
     })
   }
 
-  // Tier 2: derive auto-projects (one per inferred repo/dir) from the leftover
-  // sessions. The cwd-less bucket (NO_WORKSPACE_ID) is intentionally dropped —
-  // those sessions have no project and don't belong in the overview.
-  for (const parent of workspaceTreeFor(unowned, noWorkspaceLabel, resolver, options)) {
-    if (parent.id === NO_WORKSPACE_ID) {
+  // Tier 2: derive auto-projects from leftover sessions, but ONLY for git
+  // repositories (repoRoot). Non-git folders are never promoted.
+  const byRepoRoot = new Map<string, SessionInfo[]>()
+
+  for (const session of unowned) {
+    const cwd = (session.cwd || '').trim()
+    const repoRoot = (cwd && resolver?.(cwd)?.repoRoot) || ''
+
+    if (!repoRoot) {
+      continue
+    }
+
+    const list = byRepoRoot.get(repoRoot) ?? []
+    list.push(session)
+    byRepoRoot.set(repoRoot, list)
+  }
+
+  for (const [repoRoot, repoSessions] of byRepoRoot.entries()) {
+    const repoNodes = workspaceTreeFor(repoSessions, noWorkspaceLabel, resolver, options)
+    const repoNode = repoNodes.find(parent => parent.id === repoRoot || parent.path === repoRoot)
+
+    if (!repoNode) {
       continue
     }
 
     result.push({
-      id: parent.id,
-      label: parent.label,
-      path: parent.path,
+      id: repoRoot,
+      label: baseName(repoRoot) || repoRoot,
+      path: repoRoot,
       isAuto: true,
-      repos: [parent],
-      sessionCount: parent.sessionCount
+      repos: [repoNode],
+      sessionCount: repoNode.sessionCount
     })
   }
 

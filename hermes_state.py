@@ -33,6 +33,11 @@ def _delegate_from_json(col: str = "model_config") -> str:
     return f"json_extract(COALESCE({col}, '{{}}'), '$._delegate_from')"
 
 
+def _cwd_prefix_clause(cwd_prefix: str) -> Tuple[str, List[str]]:
+    prefix = cwd_prefix.rstrip("/\\") or cwd_prefix
+    return "(s.cwd = ? OR s.cwd LIKE ? OR s.cwd LIKE ?)", [prefix, f"{prefix}/%", f"{prefix}\\%"]
+
+
 # A child session counts as a /branch (kept visible, never cascade-deleted) if
 # it carries the stable marker OR the legacy end_reason heuristic holds.
 _BRANCH_CHILD_SQL = (
@@ -1998,6 +2003,7 @@ class SessionDB:
         self,
         source: str = None,
         exclude_sources: List[str] = None,
+        cwd_prefix: str = None,
         limit: int = 20,
         offset: int = 0,
         include_children: bool = False,
@@ -2063,6 +2069,10 @@ class SessionDB:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
             params.extend(exclude_sources)
+        if cwd_prefix:
+            clause, clause_params = _cwd_prefix_clause(cwd_prefix)
+            where_clauses.append(clause)
+            params.extend(clause_params)
         if min_message_count > 0:
             where_clauses.append("s.message_count >= ?")
             params.append(min_message_count)
@@ -3688,6 +3698,7 @@ class SessionDB:
     def session_count(
         self,
         source: str = None,
+        cwd_prefix: str = None,
         min_message_count: int = 0,
         include_archived: bool = False,
         archived_only: bool = False,
@@ -3724,6 +3735,10 @@ class SessionDB:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
             params.extend(exclude_sources)
+        if cwd_prefix:
+            clause, clause_params = _cwd_prefix_clause(cwd_prefix)
+            where_clauses.append(clause)
+            params.extend(clause_params)
         if min_message_count > 0:
             where_clauses.append("s.message_count >= ?")
             params.append(min_message_count)
